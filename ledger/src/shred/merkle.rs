@@ -867,6 +867,140 @@ pub fn recover(
         .filter_map(Result::transpose))
 }
 
+/// Like [`recover`], but returns only the recovered DATA shreds with their
+/// data headers populated, skipping the Merkle-tree rebuild, `tree.root()`
+/// verification and per-shred proof reconstruction. Intended for consumers
+/// that only deshred data payloads and neither retransmit nor store the
+/// reconstructed shreds; it trades the RS-integrity verification for roughly
+/// half the per-recovery CPU (no SHA-256 tree hashing).
+pub fn recover_data_only(
+    mut shreds: Vec<Shred>,
+    reed_solomon_cache: &ReedSolomonCache,
+) -> Result<impl Iterator<Item = Result<Shred, Error>> + use<>, Error> {
+    // Sort shreds by their erasure shard index.
+    // In particular this places all data shreds before coding shreds.
+    let is_sorted = |(a, b)| cmp_shred_erasure_shard_index(a, b).is_le();
+    if !shreds.iter().tuple_windows().all(is_sorted) {
+        shreds.sort_unstable_by(cmp_shred_erasure_shard_index);
+    }
+    // Grab {common, coding} headers from the last coding shred.
+    let (common_header, coding_header, chained_merkle_root, retransmitter_signature) = {
+        // The last shred must be a coding shred by the above sorting logic.
+        let Some(Shred::ShredCode(shred)) = shreds.last() else {
+            return Err(Error::from(TooFewParityShards));
+        };
+        let position = u32::from(shred.coding_header.position);
+        let index = shred.common_header.index.checked_sub(position);
+        let common_header = ShredCommonHeader {
+            index: index.ok_or(Error::from(InvalidIndex))?,
+            ..shred.common_header
+        };
+        let coding_header = CodingShredHeader {
+            position: 0u16,
+            ..shred.coding_header
+        };
+        (
+            common_header,
+            coding_header,
+            shred.chained_merkle_root().ok(),
+            shred.retransmitter_signature().ok(),
+        )
+    };
+    debug_assert_matches!(common_header.shred_variant, ShredVariant::MerkleCode { .. });
+    let (proof_size, resigned) = match common_header.shred_variant {
+        ShredVariant::MerkleCode {
+            proof_size,
+            resigned,
+        } => (proof_size, resigned),
+        ShredVariant::MerkleData { .. } => {
+            return Err(Error::InvalidShredVariant);
+        }
+    };
+    debug_assert!(!resigned || retransmitter_signature.is_some());
+    let num_data_shreds = usize::from(coding_header.num_data_shreds);
+    let num_coding_shreds = usize::from(coding_header.num_coding_shreds);
+    let num_shards = num_data_shreds + num_coding_shreds;
+    // Identify which shreds are missing and create stub shreds in their place.
+    let mut mask = vec![false; num_shards];
+    let mut shreds = {
+        let make_stub_shred = |erasure_shard_index| {
+            make_stub_shred(
+                erasure_shard_index,
+                &common_header,
+                &coding_header,
+                &chained_merkle_root,
+                &retransmitter_signature,
+            )
+        };
+        let mut batch = Vec::with_capacity(num_shards);
+        // By the sorting logic earlier above, this visits shreds in the order
+        // of their erasure shard index.
+        for shred in shreds {
+            // The leader signs the Merkle root and shreds in the same erasure
+            // batch have the same Merkle root. So the signatures are the same
+            // or shreds are not from the same erasure batch.
+            if shred.signature() != &common_header.signature {
+                return Err(Error::InvalidMerkleRoot);
+            }
+            let erasure_shard_index = shred.erasure_shard_index()?;
+            if !(batch.len()..num_shards).contains(&erasure_shard_index) {
+                return Err(Error::from(InvalidIndex));
+            }
+            while batch.len() < erasure_shard_index {
+                batch.push(make_stub_shred(batch.len())?);
+            }
+            mask[erasure_shard_index] = true;
+            batch.push(shred);
+        }
+        while batch.len() < num_shards {
+            batch.push(make_stub_shred(batch.len())?);
+        }
+        batch
+    };
+    // Obtain erasure encoded shards from the shreds and reconstruct shreds.
+    let mut shards = shreds
+        .iter_mut()
+        .zip(&mask)
+        .map(|(shred, &mask)| Ok((shred.erasure_shard_mut()?, mask)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    reed_solomon_cache
+        .get(num_data_shreds, num_coding_shreds)?
+        .reconstruct(&mut shards)?;
+    // Drop the mut guards to allow further mutation below.
+    drop(shards);
+    // Data-payload-only tail: after Reed-Solomon `reconstruct` above, each
+    // recovered DATA shred's erasure shard (its data header + data section) is
+    // filled, so `ShredData::get_data` returns the correct bytes. We skip
+    // agave's Merkle-tree rebuild, `tree.root()` verification and per-shred
+    // `set_merkle_proof` — that work only serves retransmit/storage. NOTE: this
+    // also drops the RS-integrity check `tree.root() == merkle_root`; callers
+    // must trust the shred source (downstream entry deserialization still
+    // rejects malformed payloads).
+    for (index, (shred, &mask)) in shreds.iter_mut().zip(&mask).enumerate() {
+        if mask || index >= num_data_shreds {
+            continue; // received (not recovered), or a coding shred
+        }
+        let Shred::ShredData(shred) = shred else {
+            return Err(Error::InvalidRecoveredShred);
+        };
+        // Populate the data header from the reconstructed payload (cheap, no
+        // hashing). `get_data` bounds-checks `size`, so sanitize is unneeded.
+        let (common_header, data_header): (ShredCommonHeader, DataShredHeader) =
+            wincode::deserialize(&shred.payload[..])?;
+        if shred.common_header != common_header {
+            return Err(Error::InvalidRecoveredShred);
+        }
+        shred.data_header = data_header;
+    }
+    Ok(shreds
+        .into_iter()
+        .zip(mask)
+        .enumerate()
+        .filter_map(move |(index, (shred, mask))| {
+            (!mask && index < num_data_shreds).then_some(Ok(shred))
+        }))
+}
+
 // Compares shreds of the same erasure batch by their erasure shard index
 // within the erasure batch.
 #[inline]
