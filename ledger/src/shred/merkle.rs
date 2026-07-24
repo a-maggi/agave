@@ -69,7 +69,7 @@ pub struct ShredCode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Shred {
+pub enum Shred {
     ShredCode(ShredCode),
     ShredData(ShredData),
 }
