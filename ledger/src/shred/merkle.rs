@@ -97,8 +97,8 @@ impl Shred {
     }
 
     #[inline]
-    pub fn shred_type(&self) -> ShredType {
-        ShredType::from(self.common_header().shred_variant)
+    pub fn shred_type(&self) -> shred::ShredType {
+        shred::ShredType::from(self.common_header().shred_variant)
     }
 
     #[inline]
